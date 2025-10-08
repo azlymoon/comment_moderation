@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Logs & databases
+*.log
+*.sqlite*
+comment_moderation.db
+
+# IDE/editor
+.idea/
+.vscode/
+*.code-workspace
+
+# OS generated
+.DS_Store
+Thumbs.db
+
+# Docs build artifacts
+docs/_build/
+
+# Credentials & local overrides
+.env
