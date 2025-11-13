@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     service_demo_name: str = Field(default="Demo Service")
     service_demo_contact: str = Field(default="demo@example.com")
 
+    @classmethod
     @field_validator("database_url")
     def validate_dsn(cls, value: str) -> str:
         allowed_schemes = ("postgresql", "sqlite")

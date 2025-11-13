@@ -13,30 +13,62 @@ from app.core import models as api_models
 from app.db import models
 
 
-async def validate_api_key(session: AsyncSession, api_key: str) -> models.WebService:
-    prefix = api_key[:8]
+async def _fetch_active_keys_by_prefix(session: AsyncSession, prefix: str) -> list[models.APIKey]:
     result = await session.execute(
         select(models.APIKey).where(
             models.APIKey.key_prefix == prefix,
             models.APIKey.is_active.is_(True),
         )
     )
-    api_keys = result.scalars().all()
-    for key in api_keys:
-        if key.verify(api_key):
-            if key.expires_at and key.expires_at < datetime.utcnow():
-                break
-            key.last_used = datetime.utcnow()
-            await session.commit()
-            await session.refresh(key)
-            service = await session.get(models.WebService, key.service_id)
-            if service is None or not service.is_active:
-                break
+    return result.scalars().all()
+
+
+def _is_key_valid(key: models.APIKey, plain_key: str) -> bool:
+    if not key.verify(plain_key):
+        return False
+    if key.expires_at and key.expires_at < datetime.utcnow():
+        return False
+    return True
+
+
+async def _get_active_service(session: AsyncSession, service_id) -> models.WebService | None:
+    service = await session.get(models.WebService, service_id)
+    if service is None or not service.is_active:
+        return None
+    return service
+
+
+async def validate_api_key(session: AsyncSession, api_key: str) -> models.WebService:
+    prefix = api_key[:8]
+    for key in await _fetch_active_keys_by_prefix(session, prefix):
+        if not _is_key_valid(key, api_key):
+            continue
+        key.last_used = datetime.utcnow()
+        await session.commit()
+        await session.refresh(key)
+        service = await _get_active_service(session, key.service_id)
+        if service:
             return service
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Invalid API key",
-    )
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
+
+
+async def _get_valid_admin_session(session: AsyncSession, token: str) -> models.AdminSession:
+    db_session = await session.get(models.AdminSession, token)
+    if db_session is None or not db_session.is_valid():
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid admin token")
+    return db_session
+
+
+async def _get_active_admin_user(session: AsyncSession, user_id) -> models.AdminUser:
+    user = await session.get(models.AdminUser, user_id)
+    if user is None or not user.is_active:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Inactive user")
+    return user
+
+
+def _check_roles(user: models.AdminUser, required_roles: Optional[Iterable[str]] = None) -> None:
+    if required_roles and user.role not in required_roles:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
 
 
 async def authenticate_admin(
@@ -44,23 +76,9 @@ async def authenticate_admin(
     token: str,
     required_roles: Optional[Iterable[str]] = None,
 ) -> models.AdminUser:
-    db_session = await session.get(models.AdminSession, token)
-    if db_session is None or not db_session.is_valid():
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid admin token",
-        )
-    user = await session.get(models.AdminUser, db_session.user_id)
-    if user is None or not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Inactive user",
-        )
-    if required_roles and user.role not in required_roles:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Insufficient permissions",
-        )
+    db_session = await _get_valid_admin_session(session, token)
+    user = await _get_active_admin_user(session, db_session.user_id)
+    _check_roles(user, required_roles)
     return map_admin_to_api(user)
 
 
@@ -214,39 +232,33 @@ async def compute_statistics(
     session: AsyncSession,
     service_id: uuid.UUID,
 ) -> api_models.StatisticsResponse:
-    result = await session.execute(
-        select(models.ModerationRequest).where(models.ModerationRequest.service_id == service_id)
+    # Requests totals via aggregation
+    total_q = await session.execute(
+        select(models.ModerationRequest.status, models.ModerationRequest.content_type).where(
+            models.ModerationRequest.service_id == service_id
+        )
     )
-    requests = result.scalars().all()
-    total = len(requests)
-    pending = sum(1 for req in requests if req.status == api_models.RequestStatus.PENDING.value)
-    text_requests = sum(1 for req in requests if req.content_type == api_models.ContentType.TEXT.value)
+    total_rows = total_q.all()
+    total = len(total_rows)
+    pending = sum(1 for st, _ in total_rows if st == api_models.RequestStatus.PENDING.value)
+    text_requests = sum(1 for _, ct in total_rows if ct == api_models.ContentType.TEXT.value)
 
+    # Results decision counts via grouped query
+    decisions_q = await session.execute(
+        select(models.ModerationResult.decision).join(models.ModerationRequest).where(
+            models.ModerationRequest.service_id == service_id
+        )
+    )
+    decisions = [row[0] for row in decisions_q.all()]
     stats = api_models.Statistics(
         service_id=str(service_id),
         date_period=datetime.utcnow(),
         total_requests=total,
         text_requests=text_requests,
+        approved_count=sum(1 for d in decisions if d == api_models.ModerationDecision.APPROVED.value),
+        rejected_count=sum(1 for d in decisions if d == api_models.ModerationDecision.REJECTED.value),
+        human_review_count=sum(1 for d in decisions if d == api_models.ModerationDecision.HUMAN_REVIEW.value),
     )
-
-    results_query = await session.execute(
-        select(models.ModerationResult).join(models.ModerationRequest).where(
-            models.ModerationRequest.service_id == service_id
-        )
-    )
-    results = results_query.scalars().all()
-    decision_counts = {
-        api_models.ModerationDecision.APPROVED: 0,
-        api_models.ModerationDecision.REJECTED: 0,
-        api_models.ModerationDecision.HUMAN_REVIEW: 0,
-    }
-    for res in results:
-        decision = api_models.ModerationDecision(res.decision)
-        decision_counts[decision] += 1
-    stats.approved_count = decision_counts[api_models.ModerationDecision.APPROVED]
-    stats.rejected_count = decision_counts[api_models.ModerationDecision.REJECTED]
-    stats.human_review_count = decision_counts[api_models.ModerationDecision.HUMAN_REVIEW]
-
     return api_models.StatisticsResponse(totals=stats, pending_requests=pending)
 
 
@@ -369,11 +381,13 @@ async def ensure_demo_data(
     service_name: str,
     service_contact: str,
 ) -> tuple[api_models.AdminUser, api_models.WebService, api_models.APIKeyIssueResponse]:
-    admin_result = await session.execute(
-        select(models.AdminUser).where(models.AdminUser.username == admin_username)
-    )
-    admin = admin_result.scalar_one_or_none()
-    if admin is None:
+    async def _ensure_admin() -> models.AdminUser:
+        result = await session.execute(
+            select(models.AdminUser).where(models.AdminUser.username == admin_username)
+        )
+        admin = result.scalar_one_or_none()
+        if admin:
+            return admin
         admin = models.AdminUser(
             username=admin_username,
             email=admin_email,
@@ -383,12 +397,15 @@ async def ensure_demo_data(
         session.add(admin)
         await session.commit()
         await session.refresh(admin)
+        return admin
 
-    service_result = await session.execute(
-        select(models.WebService).where(models.WebService.name == service_name)
-    )
-    service = service_result.scalar_one_or_none()
-    if service is None:
+    async def _ensure_service() -> models.WebService:
+        result = await session.execute(
+            select(models.WebService).where(models.WebService.name == service_name)
+        )
+        service = result.scalar_one_or_none()
+        if service:
+            return service
         service = models.WebService(
             name=service_name,
             contact_email=service_contact,
@@ -397,44 +414,52 @@ async def ensure_demo_data(
         session.add(service)
         await session.commit()
         await session.refresh(service)
+        return service
 
-    key_result = await session.execute(
-        select(models.APIKey).where(models.APIKey.service_id == service.service_id)
-    )
-    api_key = key_result.scalar_one_or_none()
-    key_response = None
-    if api_key is None:
-        key_response = await issue_api_key(session, service.service_id)
-    else:
+    async def _ensure_api_key(service: models.WebService) -> api_models.APIKeyIssueResponse:
+        result = await session.execute(
+            select(models.APIKey).where(models.APIKey.service_id == service.service_id)
+        )
+        api_key = result.scalar_one_or_none()
+        if api_key is None:
+            return await issue_api_key(session, service.service_id)
         key_payload = map_api_key_to_api(api_key)
-        key_response = api_models.APIKeyIssueResponse(api_key="", **key_payload.dict())
+        return api_models.APIKeyIssueResponse(api_key="", **key_payload.dict())
 
-    category_result = await session.execute(
-        select(models.ViolationCategory).where(models.ViolationCategory.type == api_models.CategoryType.TOXICITY.value)
-    )
-    category = category_result.scalar_one_or_none()
-    if category is None:
-        category = models.ViolationCategory(
-            type=api_models.CategoryType.TOXICITY.value,
-            name="Toxic language",
-            description="Auto-generated category for toxic language detection",
+    async def _ensure_toxic_category_and_rule() -> None:
+        result = await session.execute(
+            select(models.ViolationCategory).where(
+                models.ViolationCategory.type == api_models.CategoryType.TOXICITY.value
+            )
         )
-        session.add(category)
-        await session.commit()
-        await session.refresh(category)
+        category = result.scalar_one_or_none()
+        if category is None:
+            category = models.ViolationCategory(
+                type=api_models.CategoryType.TOXICITY.value,
+                name="Toxic language",
+                description="Auto-generated category for toxic language detection",
+            )
+            session.add(category)
+            await session.commit()
+            await session.refresh(category)
 
-    rule_result = await session.execute(select(models.ModerationRule).where(models.ModerationRule.category_id == category.category_id))
-    rule = rule_result.scalar_one_or_none()
-    if rule is None:
-        rule = models.ModerationRule(
-            category_id=category.category_id,
-            action=api_models.RuleAction.FLAG_FOR_REVIEW.value,
-            priority=10,
-            conditions="contains:toxic",
+        rule_result = await session.execute(
+            select(models.ModerationRule).where(models.ModerationRule.category_id == category.category_id)
         )
-        session.add(rule)
-        await session.commit()
+        if rule_result.scalar_one_or_none() is None:
+            rule = models.ModerationRule(
+                category_id=category.category_id,
+                action=api_models.RuleAction.FLAG_FOR_REVIEW.value,
+                priority=10,
+                conditions="contains:toxic",
+            )
+            session.add(rule)
+            await session.commit()
 
+    admin = await _ensure_admin()
+    service = await _ensure_service()
+    key_response = await _ensure_api_key(service)
+    await _ensure_toxic_category_and_rule()
     return map_admin_to_api(admin), map_service_to_api(service), key_response
 
 

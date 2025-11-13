@@ -29,3 +29,5 @@ docs/_build/
 
 # Credentials & local overrides
 .env
+
+reports/

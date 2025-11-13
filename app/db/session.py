@@ -11,32 +11,34 @@ from app.db.models import Base
 
 logger = logging.getLogger(__name__)
 
-engine: AsyncEngine | None = None
-SessionLocal: async_sessionmaker[AsyncSession] | None = None
-current_database_url: str = settings.database_url
+
+class DB:
+    engine: AsyncEngine | None = None
+    session_factory: async_sessionmaker[AsyncSession] | None = None
+    current_database_url: str = settings.database_url
 
 
 def init_engine(database_url: str | None = None) -> AsyncEngine:
-    global engine, SessionLocal, current_database_url
-    target_url = database_url or current_database_url
-    if engine is None or target_url != current_database_url:
-        current_database_url = target_url
-        engine = create_async_engine(current_database_url, echo=False, future=True)
-        SessionLocal = async_sessionmaker(
-            bind=engine,
+    target_url = database_url or DB.current_database_url
+    if DB.engine is None or target_url != DB.current_database_url:
+        DB.current_database_url = target_url
+        DB.engine = create_async_engine(DB.current_database_url, echo=False, future=True)
+        DB.session_factory = async_sessionmaker(
+            bind=DB.engine,
             expire_on_commit=False,
             class_=AsyncSession,
             autoflush=False,
         )
-    return engine
+    assert DB.engine is not None
+    return DB.engine
 
 
 @asynccontextmanager
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
-    if SessionLocal is None:
+    if DB.session_factory is None:
         init_engine()
-    assert SessionLocal is not None
-    async with SessionLocal() as session:
+    assert DB.session_factory is not None
+    async with DB.session_factory() as session:
         yield session
 
 
