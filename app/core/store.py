@@ -418,9 +418,11 @@ async def ensure_demo_data(
 
     async def _ensure_api_key(service: models.WebService) -> api_models.APIKeyIssueResponse:
         result = await session.execute(
-            select(models.APIKey).where(models.APIKey.service_id == service.service_id)
+            select(models.APIKey)
+            .where(models.APIKey.service_id == service.service_id)
+            .order_by(models.APIKey.created_at.desc())
         )
-        api_key = result.scalar_one_or_none()
+        api_key = result.scalars().first()
         if api_key is None:
             return await issue_api_key(session, service.service_id)
         key_payload = map_api_key_to_api(api_key)

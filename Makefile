@@ -1,4 +1,6 @@
 .PHONY: metrics metrics-json metrics-html lint
+TEST_FLAGS ?=
+TEST_TARGET ?= tests
 
 metrics:
 	@echo "== Radon Cyclomatic Complexity (A best, F worst) =="
@@ -25,3 +27,10 @@ metrics-html: metrics-json
 
 lint:
 	pylint -j 0 app
+
+test:
+	pytest $(TEST_FLAGS) $(TEST_TARGET)
+
+coverage:
+	pytest --cov=app --cov-report=term-missing --cov-report=html $(TEST_TARGET)
+	@echo "HTML coverage report: htmlcov/index.html"

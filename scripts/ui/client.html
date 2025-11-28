@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Comment Moderation Demo UI</title>
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: Arial, sans-serif; margin: 24px; max-width: 760px; }
+    h1 { margin-bottom: 8px; }
+    form { display: grid; gap: 12px; }
+    label { font-weight: 600; display: block; }
+    input, textarea, button {
+      font: inherit;
+      padding: 8px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+    }
+    textarea { min-height: 120px; resize: vertical; }
+    button { width: fit-content; cursor: pointer; }
+    .status { margin-top: 12px; font-size: 14px; color: #555; }
+    pre { background: #f5f5f5; padding: 12px; border-radius: 6px; overflow: auto; }
+    .row { display: grid; gap: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Comment Moderation Demo UI</h1>
+  <p>Введите Service ID, API Key и текст. Отправка идёт на <code>/api/v1/moderation/text</code> на том же хосте.</p>
+
+  <form id="moderation-form">
+    <div class="row">
+      <label for="service-id">Service ID</label>
+      <input id="service-id" name="service-id" required placeholder="UUID сервиса" />
+    </div>
+    <div class="row">
+      <label for="api-key">API Key</label>
+      <input id="api-key" name="api-key" required placeholder="plain API key" />
+    </div>
+    <div class="row">
+      <label for="content-text">Content text</label>
+      <textarea id="content-text" name="content-text" required placeholder="Введите текст для модерации"></textarea>
+    </div>
+    <button type="submit" id="submit-btn">Отправить</button>
+  </form>
+
+  <div class="status" data-testid="status" id="status"></div>
+  <div class="status">Decision: <span data-testid="result-decision" id="result-decision">—</span></div>
+  <pre id="result" data-testid="result"></pre>
+
+  <script>
+    const form = document.getElementById("moderation-form");
+    const statusEl = document.getElementById("status");
+    const decisionEl = document.getElementById("result-decision");
+    const resultEl = document.getElementById("result");
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const serviceId = document.getElementById("service-id").value.trim();
+      const apiKey = document.getElementById("api-key").value.trim();
+      const contentText = document.getElementById("content-text").value.trim();
+
+      if (!serviceId || !apiKey || !contentText) {
+        statusEl.textContent = "Заполните все поля.";
+        return;
+      }
+
+      statusEl.textContent = "Отправка запроса...";
+      decisionEl.textContent = "—";
+      resultEl.textContent = "";
+
+      try {
+        const res = await fetch("/api/v1/moderation/text", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-API-Key": apiKey,
+          },
+          body: JSON.stringify({
+            service_id: serviceId,
+            content_text: contentText,
+          }),
+        });
+
+        const payload = await res.json().catch(() => null);
+        if (!res.ok || !payload) {
+          throw new Error(`HTTP ${res.status} ${res.statusText}`);
+        }
+
+        const decision = payload.result?.decision || "n/a";
+        decisionEl.textContent = decision;
+        resultEl.textContent = JSON.stringify(payload, null, 2);
+        statusEl.textContent = "Готово";
+      } catch (err) {
+        statusEl.textContent = `Ошибка: ${err.message}`;
+        decisionEl.textContent = "error";
+        resultEl.textContent = "";
+      }
+    });
+  </script>
+</body>
+</html>
